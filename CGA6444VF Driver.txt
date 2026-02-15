@@ -1,0 +1,297 @@
+"""
+Vodafone Station CGA6444VF Driver for DOCSight
+Supports Firmware: 19.3B80-3.5.13
+
+Author: Community contribution
+Date: February 2026
+"""
+
+import hashlib
+import logging
+from binascii import hexlify
+from typing import Dict, Any, Optional
+import requests
+import time
+
+logger = logging.getLogger(__name__)
+
+
+class VodafoneStationCGA6444VFDriver:
+    """
+    Driver for Arris CGA6444VF (Vodafone Station)
+    Firmware: 19.3B80-3.5.13
+    
+    This modem uses a two-stage PBKDF2-HMAC-SHA256 authentication:
+    1. hash1 = PBKDF2(password, salt, 1000, 128bit)
+    2. hash2 = PBKDF2(hash1_hex, saltwebui, 1000, 128bit)
+    """
+    
+    def __init__(self, host: str, username: str, password: str, timeout: int = 10):
+        """
+        Initialize the driver.
+        
+        Args:
+            host: Modem IP or hostname (e.g., "192.168.0.1")
+            username: Admin username (usually "admin")
+            password: Admin password
+            timeout: Request timeout in seconds
+        """
+        self.host = host
+        self.username = username
+        self.password = password
+        self.timeout = timeout
+        self.base_url = f"http://{host}"
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'DOCSight/1.0',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest'
+        })
+        
+    def _compute_pbkdf2_hash(self, password: bytes, salt: bytes) -> str:
+        """
+        Compute PBKDF2-HMAC-SHA256 hash.
+        
+        Args:
+            password: Password as bytes
+            salt: Salt as bytes
+            
+        Returns:
+            Hex-encoded hash string
+        """
+        key = hashlib.pbkdf2_hmac('sha256', password, salt, 1000, 16)
+        return hexlify(key).decode('utf-8')
+    
+    def _derive_challenge(self, salt: str, saltwebui: str) -> str:
+        """
+        Derive the final authentication challenge using double PBKDF2.
+        
+        Args:
+            salt: Salt value from API
+            saltwebui: SaltWebUI value from API
+            
+        Returns:
+            Final hash to send as password
+        """
+        # First hash: PBKDF2(password, salt)
+        hash1 = self._compute_pbkdf2_hash(
+            self.password.encode('utf-8'),
+            salt.encode('utf-8')
+        )
+        
+        # Second hash: PBKDF2(hash1_hex_string, saltwebui)
+        # CRITICAL: hash1 must be encoded as UTF-8 string, not raw bytes
+        hash2 = self._compute_pbkdf2_hash(
+            hash1.encode('utf-8'),
+            saltwebui.encode('utf-8')
+        )
+        
+        return hash2
+    
+    def login(self) -> bool:
+        """
+        Authenticate with the modem.
+        
+        Returns:
+            True if login successful, False otherwise
+        """
+        try:
+            # Set cwd cookie
+            self.session.cookies.set('cwd', 'No', domain=self.host)
+            
+            # Step 1: Request salt values
+            logger.debug("Requesting salt values...")
+            response = self.session.post(
+                f"{self.base_url}/api/v1/session/login",
+                data={
+                    'username': self.username,
+                    'password': 'seeksalthash',
+                    'logout': 'true'
+                },
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('error') != 'ok':
+                logger.error(f"Salt request failed: {data}")
+                return False
+            
+            salt = data.get('salt')
+            saltwebui = data.get('saltwebui')
+            
+            if not salt or not saltwebui:
+                logger.error("Missing salt values in response")
+                return False
+            
+            logger.debug(f"Received salt: {salt}, saltwebui: {saltwebui}")
+            
+            # Step 2: Compute authentication challenge
+            challenge = self._derive_challenge(salt, saltwebui)
+            logger.debug(f"Computed challenge hash: {challenge}")
+            
+            # Step 3: Authenticate with challenge
+            response = self.session.post(
+                f"{self.base_url}/api/v1/session/login",
+                data={
+                    'username': self.username,
+                    'password': challenge,
+                    'logout': 'true'
+                },
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('error') != 'ok':
+                logger.error(f"Login failed: {data}")
+                return False
+            
+            logger.info("Login successful")
+            return True
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Login request failed: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error during login: {e}")
+            return False
+    
+    def logout(self):
+        """Logout from the modem (best effort)."""
+        try:
+            self.session.post(
+                f"{self.base_url}/api/v1/session/logout",
+                timeout=self.timeout
+            )
+        except Exception:
+            pass
+    
+    def get_docsis_status(self) -> Optional[Dict[str, Any]]:
+        """
+        Fetch DOCSIS status including downstream/upstream channels.
+        
+        Returns:
+            Dictionary with DOCSIS data or None on error
+        """
+        try:
+            # Add timestamp parameter to avoid caching
+            timestamp = int(time.time() * 1000)
+            
+            response = self.session.get(
+                f"{self.base_url}/api/v1/sta_docsis_status",
+                params={'_': timestamp},
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('error') != 'ok':
+                logger.error(f"DOCSIS status request failed: {data}")
+                return None
+            
+            return data.get('data', {})
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"DOCSIS status request failed: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error fetching DOCSIS status: {e}")
+            return None
+    
+    def get_system_info(self) -> Optional[Dict[str, Any]]:
+        """
+        Fetch system information (firmware, uptime, etc.).
+        
+        Returns:
+            Dictionary with system info or None on error
+        """
+        try:
+            timestamp = int(time.time() * 1000)
+            
+            # Try multiple endpoints
+            endpoints = [
+                '/api/v1/sta_system_status',
+                '/api/v1/system/status',
+                '/api/v1/device/info'
+            ]
+            
+            for endpoint in endpoints:
+                try:
+                    response = self.session.get(
+                        f"{self.base_url}{endpoint}",
+                        params={'_': timestamp},
+                        timeout=self.timeout
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data.get('error') == 'ok':
+                            return data.get('data', {})
+                except Exception:
+                    continue
+            
+            logger.warning("Could not fetch system info from any endpoint")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching system info: {e}")
+            return None
+    
+    def __enter__(self):
+        """Context manager entry."""
+        if not self.login():
+            raise RuntimeError("Failed to login to modem")
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.logout()
+
+
+# Example usage
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    
+    # Initialize driver
+    driver = VodafoneStationCGA6444VFDriver(
+        host="192.168.0.1",
+        username="admin",
+        password="your_password_here"
+    )
+    
+    # Use as context manager
+    try:
+        with driver:
+            # Get DOCSIS status
+            docsis = driver.get_docsis_status()
+            if docsis:
+                print("\n=== DOCSIS Status ===")
+                print(f"Operational Status: {docsis.get('operational', 'Unknown')}")
+                
+                # Downstream channels
+                downstream = docsis.get('downstream', [])
+                print(f"\nDownstream Channels: {len(downstream)}")
+                for ch in downstream[:3]:  # Show first 3
+                    print(f"  Ch {ch.get('channelid')}: "
+                          f"Freq={ch.get('CentralFrequency')} "
+                          f"Power={ch.get('power')} "
+                          f"SNR={ch.get('SNR')}")
+                
+                # Upstream channels
+                upstream = docsis.get('upstream', [])
+                print(f"\nUpstream Channels: {len(upstream)}")
+                for ch in upstream:
+                    print(f"  Ch {ch.get('channelid')}: "
+                          f"Freq={ch.get('CentralFrequency')} "
+                          f"Power={ch.get('power')}")
+            
+            # Get system info
+            system = driver.get_system_info()
+            if system:
+                print("\n=== System Info ===")
+                print(f"Firmware: {system.get('firmwareVersion', 'Unknown')}")
+                print(f"Hardware: {system.get('hardwareVersion', 'Unknown')}")
+                print(f"Uptime: {system.get('uptime', 'Unknown')}")
+    
+    except Exception as e:
+        print(f"Error: {e}")
