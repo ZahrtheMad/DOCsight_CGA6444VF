@@ -1,8 +1,8 @@
-#!/bin/bash
+me#!/bin/bash
 
 MODEM_IP="192.168.0.1"
-USERNAME="admin"
-PASSWORD="DEIN_PASSWORT_HIER"  # <-- ANPASSEN!
+USERNAME="Username"  # <-- default is admin
+PASSWORD="DEIN_PASSWORT_HIER"  # <-- default is password
 
 COOKIE_FILE=$(mktemp)
 
